@@ -1,5 +1,5 @@
 import math
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torchvision.transforms as T
@@ -334,11 +334,12 @@ class DeepseekOCR2Processor(ProcessorMixin):
         bos: bool = True,
         eos: bool = True,
         cropping: bool = True,
+        prompt: Optional[str] = None,
     ):
         """Tokenize text with <image> tags."""
 
         # print(conversation)
-        conversation = PROMPT
+        conversation = prompt or PROMPT
         assert conversation.count(self.image_token) == len(images)
         text_splits = conversation.split(self.image_token)
         images_list, images_crop_list, images_seq_mask, images_spatial_crop = [], [], [], []

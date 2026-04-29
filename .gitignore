@@ -1,0 +1,54 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# Virtual environments and local package state
+.venv/
+venv/
+env/
+ENV/
+.uv-cache/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Jupyter and notebook checkpoints
+.ipynb_checkpoints/
+
+# Logs and runtime output
+*.log
+logs/
+outputs/
+runs/
+tmp/
+temp/
+
+# Model/data artifacts that should not be committed by accident
+checkpoints/
+models/
+weights/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local Codex/session state
+.codex
