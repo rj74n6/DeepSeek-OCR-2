@@ -12,6 +12,8 @@ import logging
 import os
 import re
 import time
+from copy import deepcopy
+from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
@@ -26,9 +28,16 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps
+from uvicorn.config import LOGGING_CONFIG
 
 LOGGER = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+ACCESS_LOG_FORMAT = (
+    '%(asctime)s %(levelname)s [%(name)s] %(client_addr)s - '
+    '"%(request_line)s" %(status_code)s'
+)
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
 
 from deepseek_ocr2 import DeepseekOCR2ForCausalLM  # noqa: E402
 from process.image_process import DeepseekOCR2Processor  # noqa: E402
@@ -62,6 +71,15 @@ _processor: DeepseekOCR2Processor = DeepseekOCR2Processor()
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _uvicorn_log_config() -> dict:
+    config = deepcopy(LOGGING_CONFIG)
+    config["formatters"]["default"]["fmt"] = LOG_FORMAT
+    config["formatters"]["default"]["datefmt"] = LOG_DATE_FORMAT
+    config["formatters"]["access"]["fmt"] = ACCESS_LOG_FORMAT
+    config["formatters"]["access"]["datefmt"] = LOG_DATE_FORMAT
+    return config
+
 
 def _init_model(
     model_path: str,
@@ -208,6 +226,26 @@ def _extract_detections(text: str, image_width: int, image_height: int) -> List[
     return detections
 
 
+def _request_id() -> str:
+    return uuid4().hex[:12]
+
+
+def _token_count(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        return len(value)
+    except TypeError:
+        return 0
+
+
+def _output_token_count(output: Any) -> int:
+    total = 0
+    for item in getattr(output, "outputs", []) or []:
+        total += _token_count(getattr(item, "token_ids", None))
+    return total
+
+
 def _run_inference(images: List[Image.Image], prompt: str) -> List[Dict[str, Any]]:
     """Run batch inference on a list of images."""
     if _llm is None or _sampling_params is None:
@@ -221,9 +259,24 @@ def _run_inference(images: List[Image.Image], prompt: str) -> List[Dict[str, Any
 
     outputs_list = _llm.generate(batch_inputs, _sampling_params)
     t2 = time.perf_counter()
+    preprocess_s = t1 - t0
+    generate_s = t2 - t1
+    total_s = t2 - t0
+    prompt_tokens = sum(
+        _token_count(getattr(output, "prompt_token_ids", None))
+        for output in outputs_list
+    )
+    output_tokens = sum(_output_token_count(output) for output in outputs_list)
+    prompt_tps = prompt_tokens / generate_s if generate_s > 0 else 0.0
+    output_tps = output_tokens / generate_s if generate_s > 0 else 0.0
     LOGGER.info(
-        "inference timing: pages=%d preprocess=%.2fs generate=%.2fs",
-        len(images), t1 - t0, t2 - t1,
+        (
+            "inference stats: pages=%d preprocess_s=%.2f generate_s=%.2f "
+            "total_s=%.2f prompt_tokens=%d output_tokens=%d "
+            "prompt_tokens_per_s=%.2f output_tokens_per_s=%.2f"
+        ),
+        len(images), preprocess_s, generate_s, total_s,
+        prompt_tokens, output_tokens, prompt_tps, output_tps,
     )
 
     results = []
@@ -264,9 +317,19 @@ async def predict_image(request: Request, prompt: Optional[str] = None):
     if prompt is None:
         prompt = DEFAULT_PROMPT
 
+    req_id = _request_id()
+    started = time.perf_counter()
+    LOGGER.info(
+        "request start: id=%s path=/predict/image bytes=%d",
+        req_id, len(image_bytes),
+    )
     try:
         img = _load_image_bytes(image_bytes)
         results = _run_inference([img], prompt)
+        LOGGER.info(
+            "request complete: id=%s path=/predict/image images=1 total_s=%.2f",
+            req_id, time.perf_counter() - started,
+        )
         return JSONResponse({"results": results})
     except Exception as exc:
         LOGGER.exception("Inference failed")
@@ -289,11 +352,25 @@ async def predict_pdf(request: Request, prompt: Optional[str] = None, dpi: int =
     if prompt is None:
         prompt = DEFAULT_PROMPT
 
+    req_id = _request_id()
+    started = time.perf_counter()
+    LOGGER.info(
+        "request start: id=%s path=/predict/pdf bytes=%d dpi=%d",
+        req_id, len(pdf_bytes), dpi,
+    )
     try:
         t0 = time.perf_counter()
         images = _pdf_to_images(pdf_bytes, dpi=dpi)
-        LOGGER.info("pdf render: pages=%d took=%.2fs", len(images), time.perf_counter() - t0)
+        render_s = time.perf_counter() - t0
+        LOGGER.info(
+            "pdf render: id=%s pages=%d render_s=%.2f",
+            req_id, len(images), render_s,
+        )
         results = _run_inference(images, prompt)
+        LOGGER.info(
+            "request complete: id=%s path=/predict/pdf pages=%d total_s=%.2f",
+            req_id, len(images), time.perf_counter() - started,
+        )
         return JSONResponse({"page_count": len(images), "results": results})
     except Exception as exc:
         LOGGER.exception("PDF inference failed")
@@ -321,12 +398,22 @@ async def predict_batch(request: Request):
     if not images_b64:
         raise HTTPException(status_code=400, detail="No images provided.")
 
+    req_id = _request_id()
+    started = time.perf_counter()
+    LOGGER.info(
+        "request start: id=%s path=/predict/batch images=%d",
+        req_id, len(images_b64),
+    )
     try:
         pil_images = []
         for b64_str in images_b64:
             img_bytes = base64.b64decode(b64_str)
             pil_images.append(_load_image_bytes(img_bytes))
         results = _run_inference(pil_images, prompt)
+        LOGGER.info(
+            "request complete: id=%s path=/predict/batch images=%d total_s=%.2f",
+            req_id, len(pil_images), time.perf_counter() - started,
+        )
         return JSONResponse({"results": results})
     except Exception as exc:
         LOGGER.exception("Batch inference failed")
@@ -374,7 +461,12 @@ def main() -> None:
         cuda_devices=args.cuda_devices,
         enforce_eager=args.enforce_eager,
     )
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_config=_uvicorn_log_config(),
+    )
 
 
 if __name__ == "__main__":
