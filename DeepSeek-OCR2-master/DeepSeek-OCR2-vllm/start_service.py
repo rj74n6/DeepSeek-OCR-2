@@ -6,16 +6,21 @@ Usage (conda env: deepseek-ocr2):
 """
 
 import argparse
+import asyncio
 import base64
+import contextlib
 import io
 import logging
 import os
 import re
+import threading
 import time
 from copy import deepcopy
-from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 import torch
 
@@ -39,13 +44,9 @@ ACCESS_LOG_FORMAT = (
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
 
-from deepseek_ocr2 import DeepseekOCR2ForCausalLM  # noqa: E402
-from process.image_process import DeepseekOCR2Processor  # noqa: E402
 from process.ngram_norepeat import NoRepeatNGramLogitsProcessor  # noqa: E402
 from vllm import LLM, SamplingParams  # noqa: E402
 from vllm.model_executor.models.registry import ModelRegistry  # noqa: E402
-
-ModelRegistry.register_model("DeepseekOCR2ForCausalLM", DeepseekOCR2ForCausalLM)
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -56,16 +57,34 @@ DEFAULT_GPU_MEM_UTIL = 0.3
 DEFAULT_CROP_MODE = True
 DEFAULT_NUM_WORKERS = 64
 DEFAULT_PROMPT = "<image>\n<|grounding|>Convert the document to markdown."
+DEFAULT_MICROBATCH_MAX_WAIT_MS = 150
+DEFAULT_MICROBATCH_MAX_PAGES = 64
+DEFAULT_MICROBATCH_QUEUE_PAGES = 512
+DEFAULT_MICROBATCH_GENERATE_IN_THREAD = False
 
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
-app = FastAPI(title="DeepSeek-OCR-2 Service")
 _llm: Optional[LLM] = None
 _sampling_params: Optional[SamplingParams] = None
 _crop_mode: bool = DEFAULT_CROP_MODE
 _num_workers: int = DEFAULT_NUM_WORKERS
-_processor: DeepseekOCR2Processor = DeepseekOCR2Processor()
+_processor: Optional[Any] = None
+_processor_lock = threading.Lock()
+_microbatcher: Optional["MicroBatcher"] = None
+_microbatch_enabled: bool = True
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_: FastAPI):
+    try:
+        yield
+    finally:
+        if _microbatcher is not None:
+            await _microbatcher.close()
+
+
+app = FastAPI(title="DeepSeek-OCR-2 Service", lifespan=_lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +113,10 @@ def _init_model(
 
     if cuda_devices is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
+
+    from deepseek_ocr2 import DeepseekOCR2ForCausalLM
+
+    ModelRegistry.register_model("DeepseekOCR2ForCausalLM", DeepseekOCR2ForCausalLM)
 
     LOGGER.info(
         "Loading DeepSeek-OCR-2 model from '%s' (max_model_len=%d, max_num_seqs=%d, gpu_mem=%.2f, tp=%d)",
@@ -136,13 +159,15 @@ def _pdf_to_images(pdf_bytes: bytes, dpi: int = 144) -> List[Image.Image]:
     """Convert PDF bytes to a list of PIL Images."""
     images = []
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    zoom = dpi / 72.0
-    matrix = fitz.Matrix(zoom, zoom)
-    for page in doc:
-        pixmap = page.get_pixmap(matrix=matrix, alpha=False)
-        img = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
-        images.append(img)
-    doc.close()
+    try:
+        zoom = dpi / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+        for page in doc:
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            img = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+            images.append(img)
+    finally:
+        doc.close()
     return images
 
 
@@ -153,13 +178,24 @@ def _load_image_bytes(image_bytes: bytes) -> Image.Image:
     return img.convert("RGB")
 
 
+def _get_processor() -> Any:
+    global _processor  # noqa: PLW0603
+    if _processor is None:
+        with _processor_lock:
+            if _processor is None:
+                from process.image_process import DeepseekOCR2Processor
+
+                _processor = DeepseekOCR2Processor()
+    return _processor
+
+
 def _preprocess_single(image: Image.Image) -> dict:
     """Tokenize a single image for the model."""
     prompt = DEFAULT_PROMPT
     return {
         "prompt": prompt,
         "multi_modal_data": {
-            "image": _processor.tokenize_with_images(
+            "image": _get_processor().tokenize_with_images(
                 images=[image], bos=True, eos=True, cropping=_crop_mode, prompt=prompt,
             )
         },
@@ -172,7 +208,7 @@ def _preprocess_single_with_prompt(args: tuple) -> dict:
     return {
         "prompt": prompt,
         "multi_modal_data": {
-            "image": _processor.tokenize_with_images(
+            "image": _get_processor().tokenize_with_images(
                 images=[image], bos=True, eos=True, cropping=_crop_mode, prompt=prompt,
             )
         },
@@ -246,18 +282,88 @@ def _output_token_count(output: Any) -> int:
     return total
 
 
-def _run_inference(images: List[Image.Image], prompt: str) -> List[Dict[str, Any]]:
-    """Run batch inference on a list of images."""
+def _usage_for_output(output: Any) -> Dict[str, int]:
+    prompt_tokens = _token_count(getattr(output, "prompt_token_ids", None))
+    output_tokens = _output_token_count(output)
+    return {
+        "input_tokens": prompt_tokens,
+        "cached_tokens": 0,
+        "output_tokens": output_tokens,
+        "total_tokens": prompt_tokens + output_tokens,
+    }
+
+
+def _response_usage_from_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    input_tokens = 0
+    cached_tokens = 0
+    output_tokens = 0
+    total_tokens = 0
+
+    for result in results:
+        usage = result.pop("_usage", None) or {}
+        input_tokens += int(usage.get("input_tokens", 0) or 0)
+        cached_tokens += int(usage.get("cached_tokens", 0) or 0)
+        output_tokens += int(usage.get("output_tokens", 0) or 0)
+        total_tokens += int(usage.get("total_tokens", 0) or 0)
+
+    return {
+        "input_tokens": input_tokens,
+        "cached_tokens": cached_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "input_tokens_details": {"cached_tokens": cached_tokens},
+    }
+
+
+def _outputs_to_results(outputs_list: list[Any], images: list[Image.Image]) -> List[Dict[str, Any]]:
+    if len(outputs_list) != len(images):
+        raise RuntimeError(
+            f"Model returned {len(outputs_list)} outputs for {len(images)} inputs."
+        )
+
+    results = []
+    for output, img in zip(outputs_list, images):
+        raw_text = output.outputs[0].text
+        w, h = img.size
+        has_eos = "<｜end▁of▁sentence｜>" in raw_text
+        results.append({
+            "raw_text": raw_text,
+            "clean_text": _clean_output(raw_text),
+            "detections": _extract_detections(raw_text, w, h),
+            "has_eos": has_eos,
+            "image_size": {"width": w, "height": h},
+            "_usage": _usage_for_output(output),
+        })
+    return results
+
+
+def _run_inference_inputs(
+    inputs: list[tuple[Image.Image, str]],
+    *,
+    parallel_preprocess: bool = True,
+) -> List[Dict[str, Any]]:
+    """Run batch inference on a list of ``(image, prompt)`` inputs."""
     if _llm is None or _sampling_params is None:
         raise RuntimeError("Model not initialized.")
+    if not inputs:
+        return []
 
-    args_list = [(img, prompt) for img in images]
     t0 = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=_num_workers) as executor:
-        batch_inputs = list(executor.map(_preprocess_single_with_prompt, args_list))
+    _get_processor()
+    if parallel_preprocess and len(inputs) > 1:
+        with ThreadPoolExecutor(max_workers=_num_workers) as executor:
+            batch_inputs = list(executor.map(_preprocess_single_with_prompt, inputs))
+    else:
+        batch_inputs = [_preprocess_single_with_prompt(item) for item in inputs]
     t1 = time.perf_counter()
 
     outputs_list = _llm.generate(batch_inputs, _sampling_params)
+    if len(outputs_list) != len(inputs):
+        raise RuntimeError(
+            f"Model returned {len(outputs_list)} outputs for {len(inputs)} inputs."
+        )
     t2 = time.perf_counter()
     preprocess_s = t1 - t0
     generate_s = t2 - t1
@@ -275,23 +381,195 @@ def _run_inference(images: List[Image.Image], prompt: str) -> List[Dict[str, Any
             "total_s=%.2f prompt_tokens=%d output_tokens=%d "
             "prompt_tokens_per_s=%.2f output_tokens_per_s=%.2f"
         ),
-        len(images), preprocess_s, generate_s, total_s,
+        len(inputs), preprocess_s, generate_s, total_s,
         prompt_tokens, output_tokens, prompt_tps, output_tps,
     )
+    return _outputs_to_results(outputs_list, [img for img, _ in inputs])
 
-    results = []
-    for output, img in zip(outputs_list, images):
-        raw_text = output.outputs[0].text
-        w, h = img.size
-        has_eos = "<｜end▁of▁sentence｜>" in raw_text
-        results.append({
-            "raw_text": raw_text,
-            "clean_text": _clean_output(raw_text),
-            "detections": _extract_detections(raw_text, w, h),
-            "has_eos": has_eos,
-            "image_size": {"width": w, "height": h},
-        })
-    return results
+
+def _run_inference(images: List[Image.Image], prompt: str) -> List[Dict[str, Any]]:
+    """Run batch inference on a list of images for one request."""
+    return _run_inference_inputs([(img, prompt) for img in images])
+
+
+@dataclass
+class _BatchItem:
+    request_id: str
+    page_index: int
+    image: Image.Image
+    prompt: str
+    future: asyncio.Future
+    queued_at: float
+
+
+class MicroBatcher:
+    """Collect pages across HTTP requests and feed larger batches to vLLM."""
+
+    def __init__(
+        self,
+        *,
+        max_wait_ms: int,
+        max_pages: int,
+        queue_pages: int,
+        generate_in_thread: bool,
+    ) -> None:
+        self.max_wait_s = max(0, max_wait_ms) / 1000.0
+        self.max_pages = max(1, max_pages)
+        self.queue: asyncio.Queue[_BatchItem] = asyncio.Queue(maxsize=max(1, queue_pages))
+        self._worker_task: asyncio.Task | None = None
+        self._closed = False
+        self._executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="deepseek-microbatch")
+            if generate_in_thread
+            else None
+        )
+
+    def start(self) -> None:
+        if self._closed:
+            raise RuntimeError("Microbatcher is closed.")
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._worker_loop())
+
+    async def close(self) -> None:
+        self._closed = True
+        if self._worker_task is None:
+            self._fail_queued(RuntimeError("Microbatcher closed."))
+        else:
+            self._worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._worker_task
+            self._worker_task = None
+            self._fail_queued(RuntimeError("Microbatcher closed."))
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
+
+    def _fail_items(self, items: List[_BatchItem], exc: BaseException) -> None:
+        for item in items:
+            if not item.future.done():
+                item.future.set_exception(exc)
+
+    def _fail_queued(self, exc: BaseException) -> None:
+        while True:
+            try:
+                item = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not item.future.done():
+                item.future.set_exception(exc)
+
+    async def submit_many(
+        self,
+        images: List[Image.Image],
+        prompt: str,
+        request_id: str,
+    ) -> List[Dict[str, Any]]:
+        self.start()
+        loop = asyncio.get_running_loop()
+        futures = []
+        try:
+            for page_index, image in enumerate(images):
+                future = loop.create_future()
+                futures.append(future)
+                await self.queue.put(
+                    _BatchItem(
+                        request_id=request_id,
+                        page_index=page_index,
+                        image=image,
+                        prompt=prompt,
+                        future=future,
+                        queued_at=loop.time(),
+                    )
+                )
+            if not futures:
+                return []
+            return await asyncio.gather(*futures)
+        except asyncio.CancelledError:
+            for future in futures:
+                future.cancel()
+            raise
+
+    async def _worker_loop(self) -> None:
+        while True:
+            batch: List[_BatchItem] = []
+            try:
+                first = await self.queue.get()
+                batch = [first]
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + self.max_wait_s
+
+                while len(batch) < self.max_pages:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        batch.append(await asyncio.wait_for(self.queue.get(), timeout=remaining))
+                    except asyncio.TimeoutError:
+                        break
+
+                await self._run_batch(batch)
+            except asyncio.CancelledError as exc:
+                self._fail_items(batch, RuntimeError("Microbatcher closed."))
+                raise exc
+
+    async def _run_batch(self, batch: List[_BatchItem]) -> None:
+        active = [item for item in batch if not item.future.cancelled()]
+        if not active:
+            return
+
+        request_count = len({item.request_id for item in active})
+        now = asyncio.get_running_loop().time()
+        waits_ms = sorted((now - item.queued_at) * 1000 for item in active)
+        wait_p50_ms = waits_ms[len(waits_ms) // 2]
+        wait_max_ms = waits_ms[-1]
+
+        try:
+            started = time.perf_counter()
+            inference = partial(
+                _run_inference_inputs,
+                [(item.image, item.prompt) for item in active],
+            )
+            if self._executor is None:
+                results = inference()
+            else:
+                results = await asyncio.get_running_loop().run_in_executor(
+                    self._executor,
+                    inference,
+                )
+            elapsed = time.perf_counter() - started
+        except Exception as exc:
+            LOGGER.exception(
+                "microbatch failed: pages=%d requests=%d",
+                len(active), request_count,
+            )
+            for item in active:
+                if not item.future.done():
+                    item.future.set_exception(exc)
+            return
+
+        LOGGER.info(
+            (
+                "microbatch complete: pages=%d requests=%d wait_p50_ms=%.1f "
+                "wait_max_ms=%.1f queue_pages_after_start=%d total_s=%.2f"
+            ),
+            len(active), request_count, wait_p50_ms, wait_max_ms,
+            self.queue.qsize(), elapsed,
+        )
+        for item, result in zip(active, results):
+            if not item.future.done():
+                item.future.set_result(result)
+
+
+async def _run_inference_for_request(
+    images: List[Image.Image],
+    prompt: str,
+    request_id: str,
+) -> List[Dict[str, Any]]:
+    if not _microbatch_enabled:
+        return _run_inference(images, prompt)
+    if _microbatcher is None:
+        raise RuntimeError("Microbatcher is not initialized.")
+    return await _microbatcher.submit_many(images, prompt, request_id)
 
 
 # ---------------------------------------------------------------------------
@@ -325,12 +603,13 @@ async def predict_image(request: Request, prompt: Optional[str] = None):
     )
     try:
         img = _load_image_bytes(image_bytes)
-        results = _run_inference([img], prompt)
+        results = await _run_inference_for_request([img], prompt, req_id)
         LOGGER.info(
             "request complete: id=%s path=/predict/image images=1 total_s=%.2f",
             req_id, time.perf_counter() - started,
         )
-        return JSONResponse({"results": results})
+        usage = _response_usage_from_results(results)
+        return JSONResponse({"results": results, "usage": usage})
     except Exception as exc:
         LOGGER.exception("Inference failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -366,12 +645,13 @@ async def predict_pdf(request: Request, prompt: Optional[str] = None, dpi: int =
             "pdf render: id=%s pages=%d render_s=%.2f",
             req_id, len(images), render_s,
         )
-        results = _run_inference(images, prompt)
+        results = await _run_inference_for_request(images, prompt, req_id)
         LOGGER.info(
             "request complete: id=%s path=/predict/pdf pages=%d total_s=%.2f",
             req_id, len(images), time.perf_counter() - started,
         )
-        return JSONResponse({"page_count": len(images), "results": results})
+        usage = _response_usage_from_results(results)
+        return JSONResponse({"page_count": len(images), "results": results, "usage": usage})
     except Exception as exc:
         LOGGER.exception("PDF inference failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -409,12 +689,13 @@ async def predict_batch(request: Request):
         for b64_str in images_b64:
             img_bytes = base64.b64decode(b64_str)
             pil_images.append(_load_image_bytes(img_bytes))
-        results = _run_inference(pil_images, prompt)
+        results = await _run_inference_for_request(pil_images, prompt, req_id)
         LOGGER.info(
             "request complete: id=%s path=/predict/batch images=%d total_s=%.2f",
             req_id, len(pil_images), time.perf_counter() - started,
         )
-        return JSONResponse({"results": results})
+        usage = _response_usage_from_results(results)
+        return JSONResponse({"results": results, "usage": usage})
     except Exception as exc:
         LOGGER.exception("Batch inference failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -437,20 +718,69 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-mode", action="store_true", default=True, help="Enable image cropping (default: on).")
     parser.add_argument("--no-crop-mode", dest="crop_mode", action="store_false", help="Disable image cropping.")
     parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS, help="Image preprocessing workers.")
+    parser.add_argument(
+        "--microbatch-max-wait-ms",
+        type=int,
+        default=DEFAULT_MICROBATCH_MAX_WAIT_MS,
+        help="Maximum time to wait for more pages after the first queued page (default: 150).",
+    )
+    parser.add_argument(
+        "--microbatch-max-pages",
+        type=int,
+        default=DEFAULT_MICROBATCH_MAX_PAGES,
+        help="Maximum pages per cross-request GPU batch (default: 64).",
+    )
+    parser.add_argument(
+        "--microbatch-queue-pages",
+        type=int,
+        default=DEFAULT_MICROBATCH_QUEUE_PAGES,
+        help="Maximum queued pages waiting for GPU microbatching (default: 512).",
+    )
+    parser.add_argument(
+        "--disable-microbatching",
+        action="store_true",
+        default=False,
+        help="Disable cross-request microbatching and use the previous per-request inference path.",
+    )
+    parser.add_argument(
+        "--microbatch-generate-in-thread",
+        action="store_true",
+        default=False,
+        help=(
+            "Run microbatch inference in a dedicated executor thread. "
+            "Experimental: useful for testing whether event-loop blocking is limiting throughput."
+        ),
+    )
     parser.add_argument("--enforce-eager", action="store_true", default=False,
                         help="Disable CUDA graph capture (slower decode, less VRAM, faster startup).")
     args = parser.parse_args()
     if not args.model_path.strip():
         parser.error("--model-path must not be empty.")
+    if args.microbatch_max_wait_ms < 0:
+        parser.error("--microbatch-max-wait-ms must be greater than or equal to 0.")
+    if args.microbatch_max_pages < 1:
+        parser.error("--microbatch-max-pages must be greater than or equal to 1.")
+    if args.microbatch_queue_pages < 1:
+        parser.error("--microbatch-queue-pages must be greater than or equal to 1.")
     return args
 
 
 def main() -> None:
     args = parse_args()
 
-    global _crop_mode, _num_workers  # noqa: PLW0603
+    global _crop_mode, _microbatch_enabled, _microbatcher, _num_workers  # noqa: PLW0603
     _crop_mode = args.crop_mode
     _num_workers = args.num_workers
+    _microbatch_enabled = not args.disable_microbatching
+    _microbatcher = MicroBatcher(
+        max_wait_ms=args.microbatch_max_wait_ms,
+        max_pages=args.microbatch_max_pages,
+        queue_pages=args.microbatch_queue_pages,
+        generate_in_thread=(
+            DEFAULT_MICROBATCH_GENERATE_IN_THREAD
+            or args.microbatch_generate_in_thread
+        ),
+    )
 
     _init_model(
         model_path=args.model_path,
@@ -461,6 +791,24 @@ def main() -> None:
         cuda_devices=args.cuda_devices,
         enforce_eager=args.enforce_eager,
     )
+    LOGGER.info(
+        (
+            "Microbatching %s (max_wait_ms=%d, max_pages=%d, queue_pages=%d)"
+        ),
+        "enabled" if _microbatch_enabled else "disabled",
+        args.microbatch_max_wait_ms,
+        args.microbatch_max_pages,
+        args.microbatch_queue_pages,
+    )
+    if _microbatch_enabled:
+        LOGGER.info(
+            "Microbatch inference runs %s",
+            (
+                "in a dedicated executor thread"
+                if args.microbatch_generate_in_thread
+                else "synchronously on the FastAPI event loop"
+            ),
+        )
     uvicorn.run(
         app,
         host=args.host,
