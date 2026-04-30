@@ -26,7 +26,7 @@ in `requirements.txt`, plus PyTorch, vLLM, and flash-attn.
 Start the OCR service:
 
 ```bash
-./run.sh --model-path /path/to/DeepSeek-OCR-2 --port 8888
+./run.sh --model-path /path/to/DeepSeek-OCR-2 --port 8300
 ```
 
 Optional arguments are forwarded to `start_service.py`:
@@ -36,19 +36,19 @@ Optional arguments are forwarded to `start_service.py`:
   --model-path /path/to/DeepSeek-OCR-2 \
   --gpu-memory-utilization 0.85 \
   --cuda-devices 0 \
-  --port 8888
+  --port 8300
 ```
 
 Point the KIE backend at the service:
 
 ```bash
-DEEPSEEK_OCR_ENDPOINT=http://localhost:8888
+DEEPSEEK_OCR_ENDPOINT=http://localhost:8300
 ```
 
 ## Check
 
 ```bash
-curl http://localhost:8888/health
+curl http://localhost:8300/health
 ```
 
 Expected shape:

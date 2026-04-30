@@ -1,7 +1,7 @@
 """DeepSeek-OCR-2 model service based on vLLM.
 
 Usage (conda env: deepseek-ocr2):
-    python start_service.py --model-path /path/to/model --port 8888
+    python start_service.py --model-path /path/to/model --port 8300
     python start_service.py --model-path /path/to/model --gpu-memory-utilization 0.85
 """
 
@@ -427,7 +427,7 @@ async def predict_batch(request: Request):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DeepSeek-OCR-2 model service (vLLM)")
     parser.add_argument("--host", default="0.0.0.0", help="Bind host.")
-    parser.add_argument("--port", type=int, default=8888, help="Bind port.")
+    parser.add_argument("--port", type=int, default=8300, help="Bind port.")
     parser.add_argument("--model-path", required=True, help="HuggingFace model ID or local path.")
     parser.add_argument("--max-model-len", type=int, default=DEFAULT_MAX_MODEL_LEN)
     parser.add_argument("--max-num-seqs", type=int, default=DEFAULT_MAX_CONCURRENCY)
