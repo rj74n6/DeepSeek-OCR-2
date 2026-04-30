@@ -67,6 +67,30 @@ Expected shape:
 {"images":["<base64-image>"],"prompt":"<optional prompt>"}
 ```
 
+## Offline Batch Runner
+
+For maximum throughput on offline corpora, bypass the HTTP service and run
+vLLM directly over global page batches:
+
+```bash
+uv run python tools/offline_ocr_batch.py \
+  /path/to/documents \
+  --model-path /path/to/DeepSeek-OCR-2 \
+  --batch-pages 64 \
+  --gpu-memory-utilization 0.60 \
+  --max-num-seqs 128 \
+  --output-jsonl /tmp/deepseek_ocr_outputs.jsonl \
+  --metrics-json /tmp/deepseek_ocr_metrics.json
+```
+
+Use `--preprocess-executor process` to test whether Python preprocessing is
+limiting throughput. The process pool is started before the vLLM model is
+initialized so it does not fork after CUDA initialization.
+
+The metrics file reports successful output totals as `pages` and raw GPU work
+as `generated_pages`; these differ when a document fails after some pages were
+already generated.
+
 ## Source
 
 DeepSeek upstream project links:
