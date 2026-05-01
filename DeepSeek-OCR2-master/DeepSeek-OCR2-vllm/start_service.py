@@ -52,7 +52,7 @@ from vllm.model_executor.models.registry import ModelRegistry  # noqa: E402
 # Defaults
 # ---------------------------------------------------------------------------
 DEFAULT_MAX_MODEL_LEN = 8192
-DEFAULT_MAX_CONCURRENCY = 100
+DEFAULT_MAX_CONCURRENCY = 128
 DEFAULT_GPU_MEM_UTIL = 0.3
 DEFAULT_CROP_MODE = True
 DEFAULT_NUM_WORKERS = 64
