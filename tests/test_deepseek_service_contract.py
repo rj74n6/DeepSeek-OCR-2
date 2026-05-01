@@ -1,4 +1,5 @@
 import io
+import json
 import sys
 import types
 import unittest
@@ -101,6 +102,9 @@ class DeepSeekServiceResponseTests(unittest.IsolatedAsyncioTestCase):
             "_microbatch_enabled": start_service._microbatch_enabled,
             "_pdf_to_images": start_service._pdf_to_images,
             "_num_workers": start_service._num_workers,
+            "_render_workers": start_service._render_workers,
+            "_render_executor": start_service._render_executor,
+            "_preprocess_executor": start_service._preprocess_executor,
         }
         start_service._llm = _FakeLLM()
         start_service._sampling_params = object()
@@ -126,6 +130,7 @@ class DeepSeekServiceResponseTests(unittest.IsolatedAsyncioTestCase):
         await self.client.aclose()
         if start_service._microbatcher is not None:
             await start_service._microbatcher.close()
+        start_service._shutdown_cpu_executors()
         for name, value in self.originals.items():
             setattr(start_service, name, value)
 
@@ -140,6 +145,19 @@ class DeepSeekServiceResponseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["usage"]["input_tokens_details"], {"cached_tokens": 0})
         for result in body["results"]:
             self.assertNotIn("_usage", result)
+            self.assertNotIn("_batch_id", result)
+            self.assertNotIn("_queue_wait_ms", result)
+
+    def assert_timing(self, response, *, expected_step: str, pages: int):
+        self.assertIn("x-kie-timing", response.headers)
+        timing = json.loads(response.headers["x-kie-timing"])
+        self.assertIsInstance(timing["total_ms"], int)
+        self.assertEqual(timing["page_count"], pages)
+        self.assertIn(expected_step, timing["steps"])
+        self.assertIn("cpu_preprocess", timing["steps"])
+        self.assertIn("gpu_generate", timing["steps"])
+        self.assertIn("postprocess_cpu", timing["steps"])
+        self.assertIn("response_build", timing["steps"])
 
     async def test_predict_pdf_response_includes_usage(self):
         response = await self.client.post("/predict/pdf", content=b"%PDF-1.7")
@@ -152,6 +170,7 @@ class DeepSeekServiceResponseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["results"][0]["raw_text"], "raw:pdf-0")
         self.assertEqual(body["results"][1]["raw_text"], "raw:pdf-1")
         self.assert_usage(body, pages=2)
+        self.assert_timing(response, expected_step="pdf_render_cpu", pages=2)
 
     async def test_predict_image_response_includes_usage(self):
         response = await self.client.post("/predict/image", content=_png_bytes())
@@ -163,6 +182,7 @@ class DeepSeekServiceResponseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("raw_text", body["results"][0])
         self.assertIn("image_size", body["results"][0])
         self.assert_usage(body, pages=1)
+        self.assert_timing(response, expected_step="image_decode_cpu", pages=1)
 
     async def test_predict_batch_response_includes_usage(self):
         import base64
@@ -181,6 +201,7 @@ class DeepSeekServiceResponseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(body["results"]), 2)
         self.assertIn("raw_text", body["results"][0])
         self.assert_usage(body, pages=2)
+        self.assert_timing(response, expected_step="image_decode_cpu", pages=2)
 
 
 if __name__ == "__main__":

@@ -239,11 +239,12 @@ class MicroBatchingTests(unittest.IsolatedAsyncioTestCase):
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         future.cancel()
+        prepared = start_service._preprocess_prepared_input((0, _image("x"), "prompt"))
         item = start_service._BatchItem(
             request_id="req",
             page_index=0,
-            image=_image("x"),
-            prompt="prompt",
+            batch_input=prepared.batch_input,
+            image_size=prepared.image_size,
             future=future,
             queued_at=loop.time(),
         )
@@ -283,6 +284,22 @@ class MicroBatchingTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "Microbatcher is closed"):
             await batcher.submit_many([_image("x")], "prompt", "req")
+
+    async def test_empty_prepared_request_skips_generate(self):
+        fake_llm = _FakeLLM()
+        start_service._llm = fake_llm
+        start_service._microbatch_enabled = False
+        timer = start_service.StepTimer()
+
+        results = await start_service._run_prepared_inference_for_request(
+            [],
+            "req",
+            timer,
+        )
+
+        self.assertEqual(results, [])
+        self.assertEqual(fake_llm.calls, [])
+        self.assertEqual(timer.summary()["gpu_batches"], 0)
 
 
 if __name__ == "__main__":
