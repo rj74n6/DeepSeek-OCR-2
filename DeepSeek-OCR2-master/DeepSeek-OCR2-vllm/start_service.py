@@ -52,16 +52,16 @@ from vllm.model_executor.models.registry import ModelRegistry  # noqa: E402
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-DEFAULT_MAX_MODEL_LEN = 8192
-DEFAULT_MAX_CONCURRENCY = 128
 DEFAULT_GPU_MEM_UTIL = 0.3
-DEFAULT_CROP_MODE = True
-DEFAULT_NUM_WORKERS = 64
-DEFAULT_PROMPT = "<image>\n<|grounding|>Convert the document to markdown."
-DEFAULT_MICROBATCH_MAX_WAIT_MS = 150
-DEFAULT_MICROBATCH_MAX_PAGES = 64
-DEFAULT_MICROBATCH_QUEUE_PAGES = 512
+DEFAULT_NUM_WORKERS = 16
 DEFAULT_RENDER_WORKERS = min(8, os.cpu_count() or 4)
+DEFAULT_MAX_CONCURRENCY = 128
+DEFAULT_MICROBATCH_MAX_PAGES = 128
+DEFAULT_MICROBATCH_MAX_WAIT_MS = 150
+DEFAULT_MICROBATCH_QUEUE_PAGES = 512
+DEFAULT_MAX_MODEL_LEN = 8192
+DEFAULT_CROP_MODE = True
+DEFAULT_PROMPT = "<image>\n<|grounding|>Convert the document to markdown."
 
 # ---------------------------------------------------------------------------
 # Global state
