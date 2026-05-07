@@ -52,4 +52,8 @@ if [ "${HAS_MODEL_PATH}" -ne 1 ]; then
 fi
 
 cd "${SERVICE_DIR}"
+if [ -x "${SCRIPT_DIR}/.venv/bin/python" ]; then
+  exec "${SCRIPT_DIR}/.venv/bin/python" start_service.py "${ARGS[@]}"
+fi
+
 exec uv run python start_service.py "${ARGS[@]}"
