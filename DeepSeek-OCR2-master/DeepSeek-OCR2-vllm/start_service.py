@@ -217,6 +217,7 @@ def _init_model(
     if cuda_devices is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
 
+    os.environ["DEEPSEEK_OCR2_MODEL_PATH"] = model_path
     from deepseek_ocr2 import DeepseekOCR2ForCausalLM
 
     ModelRegistry.register_model("DeepseekOCR2ForCausalLM", DeepseekOCR2ForCausalLM)
